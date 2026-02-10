@@ -33,17 +33,29 @@ class FullModel(nn.Module):
         channels: list[int] | None = None,
         prompt_dim: int = 64,
         num_degradations: int = 3,
+        use_checkpoint: bool = True,
+        attn_chunk_size: int | None = 1024,
     ) -> None:
         super().__init__()
         channels = channels or [32, 64, 128]
-        self.encoder = RestormerEncoder(channels, prompt_dim)
-        self.decoder = RestormerDecoder(channels)
+        self.encoder = RestormerEncoder(
+            channels,
+            prompt_dim,
+            use_checkpoint=use_checkpoint,
+            attn_chunk_size=attn_chunk_size,
+        )
+        self.decoder = RestormerDecoder(
+            channels,
+            use_checkpoint=use_checkpoint,
+            attn_chunk_size=attn_chunk_size,
+        )
         self.modality_predictor = ModalityPredictor(channels[2])
         self.degradation_predictor = DegradationPredictor(channels[0], num_degradations)
         self.prompt_pool = PromptPool(2, num_degradations, prompt_dim)
         self.num_prompts = self.prompt_pool.num_modalities * self.prompt_pool.num_degradations
 
     def forward(self, x: torch.Tensor) -> ModelOutput:
+        orig_height, orig_width = x.shape[-2:]
         # First pass without prompts to predict modality and degradation
         zero_prompt = torch.zeros(x.size(0), self.prompt_pool.prompt_dim, device=x.device)
         feat1, feat2, feat3 = self.encoder(x, zero_prompt)
@@ -54,6 +66,7 @@ class FullModel(nn.Module):
         prompt = self.prompt_pool(prompt_weights)
         feat1, feat2, feat3 = self.encoder(x, prompt)
         reconstructed = self.decoder(feat1, feat2, feat3)
+        reconstructed = reconstructed[..., :orig_height, :orig_width]
         return ModelOutput(
             reconstructed=reconstructed,
             modality_probs=modality_probs,
