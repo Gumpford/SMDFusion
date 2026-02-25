@@ -14,7 +14,7 @@ class TinyImageEncoder(nn.Module):
 
     def __init__(self, out_dim: int = 512) -> None:
         super().__init__()
-        self.net = nn.Sequential(
+        self.backbone = nn.Sequential(
             nn.Conv2d(3, 64, 3, stride=2, padding=1),
             nn.GELU(),
             nn.Conv2d(64, 128, 3, stride=2, padding=1),
@@ -23,11 +23,11 @@ class TinyImageEncoder(nn.Module):
             nn.GELU(),
             nn.AdaptiveAvgPool2d(1),
         )
-        self.proj = nn.Linear(256, out_dim)
+        self.fc = nn.Linear(256, out_dim)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        feat = self.net(images).flatten(1)
-        return self.proj(feat)
+        feat = self.backbone(images).flatten(1)
+        return self.fc(feat)
 
 
 @dataclass
@@ -43,6 +43,34 @@ class PredictorConfig:
     freeze_clip: bool = True
 
 
+class ClipVisualEncoder(nn.Module):
+    """Wrapper for open_clip visual encoder outputting global image features."""
+
+    def __init__(self, model_name: str, freeze_clip: bool = True) -> None:
+        super().__init__()
+        try:
+            import open_clip
+        except ImportError as exc:
+            raise ImportError(
+                "use_clip=True requires open_clip_torch. Install it or set --use_clip false."
+            ) from exc
+
+        model, _, _ = open_clip.create_model_and_transforms(
+            model_name,
+            pretrained="laion2b_s32b_b79k",
+        )
+        self.model = model.visual
+        if freeze_clip:
+            self.freeze_clip()
+
+    def freeze_clip(self) -> None:
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return self.model(images)
+
+
 class HierarchicalPromptPredictor(nn.Module):
     """Predict modality and per-modality degradation, then synthesize global gating P."""
 
@@ -55,42 +83,49 @@ class HierarchicalPromptPredictor(nn.Module):
         self.temperature = config.temperature
         self.label_smoothing = config.label_smoothing
 
-        self.backbone = self._build_backbone()
-        self.shared_mlp = nn.Sequential(
-            nn.Linear(self.feat_dim, config.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.GELU(),
-        )
+        self.encoder = self._build_encoder()
+        self.fc1 = nn.Linear(self.feat_dim, config.hidden_dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.drop = nn.Dropout(0.1)
+        self.fc2 = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.modality_head = nn.Linear(config.hidden_dim, 2)
         self.deg_head_ir = nn.Linear(config.hidden_dim, self.kir)
         self.deg_head_vi = nn.Linear(config.hidden_dim, self.kvi)
 
-    def _build_backbone(self) -> nn.Module:
-        if not self.config.use_clip:
-            return TinyImageEncoder(self.feat_dim)
-        try:
-            import open_clip
-        except ImportError as exc:
-            raise ImportError(
-                "use_clip=True requires open_clip_torch. Install it or set --use_clip false."
-            ) from exc
-        model, _, _ = open_clip.create_model_and_transforms(self.config.clip_model_name, pretrained="laion2b_s32b_b79k")
-        if self.config.freeze_clip:
-            for p in model.parameters():
-                p.requires_grad = False
-        self._clip_model = model
+    def _build_encoder(self) -> nn.Module:
+        if self.config.use_clip:
+            return ClipVisualEncoder(self.config.clip_model_name, freeze_clip=self.config.freeze_clip)
+        return TinyImageEncoder(out_dim=self.feat_dim)
 
-        class _ClipWrapper(nn.Module):
-            def __init__(self, clip_model: nn.Module) -> None:
-                super().__init__()
-                self.clip_model = clip_model
+    def freeze_clip(self) -> None:
+        """Compatibility helper similar to common classifier code style."""
+        if isinstance(self.encoder, ClipVisualEncoder):
+            self.encoder.freeze_clip()
 
-            def forward(self, images: torch.Tensor) -> torch.Tensor:
-                return self.clip_model.encode_image(images)
+    def _extract_feat(
+        self,
+        images: torch.Tensor | None = None,
+        feat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (images is None) == (feat is None):
+            raise ValueError("Provide exactly one of images or feat")
 
-        return _ClipWrapper(model)
+        if feat is None:
+            if images is None or images.ndim != 4:
+                raise ValueError("images must be Tensor(B,3,H,W)")
+            feat = self.encoder(images)
+
+        if feat.ndim != 2:
+            raise ValueError(f"Expected feature shape (B,C), got {tuple(feat.shape)}")
+        assert feat.size(1) == self.feat_dim, f"feat dim mismatch: {feat.size(1)} vs {self.feat_dim}"
+        return feat
+
+    def _predict_logits(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden = self.fc2(self.drop(self.relu(self.fc1(feat))))
+        logits_mod = self.modality_head(hidden)
+        logits_deg_ir = self.deg_head_ir(hidden)
+        logits_deg_vi = self.deg_head_vi(hidden)
+        return logits_mod, logits_deg_ir, logits_deg_vi
 
     def _stable_softmax(self, logits: torch.Tensor) -> torch.Tensor:
         scaled = logits / max(self.temperature, 1e-6)
@@ -102,43 +137,37 @@ class HierarchicalPromptPredictor(nn.Module):
             probs = (1.0 - eps) * probs + eps / num_classes
         return probs
 
+    def _compose_gating(
+        self,
+        p_mod: torch.Tensor,
+        p_deg_ir: torch.Tensor,
+        p_deg_vi: torch.Tensor,
+    ) -> torch.Tensor:
+        p_ir = p_mod[:, 0:1] * p_deg_ir
+        p_vi = p_mod[:, 1:2] * p_deg_vi
+        p_global = torch.cat([p_ir, p_vi], dim=-1)
+        return p_global
+
     def forward(
         self,
         images: torch.Tensor | None = None,
         feat: torch.Tensor | None = None,
         return_logits: bool = False,
     ) -> dict[str, torch.Tensor]:
-        if (images is None) == (feat is None):
-            raise ValueError("Provide exactly one of images or feat")
-
-        if feat is None:
-            if images is None or images.ndim != 4:
-                raise ValueError("images must be Tensor(B,3,H,W)")
-            feat = self.backbone(images)
-
-        if feat.ndim != 2:
-            raise ValueError(f"Expected feature shape (B,C), got {tuple(feat.shape)}")
-        assert feat.size(1) == self.feat_dim, f"feat dim mismatch: {feat.size(1)} vs {self.feat_dim}"
-
-        hid = self.shared_mlp(feat)
-        logits_mod = self.modality_head(hid)
-        logits_deg_ir = self.deg_head_ir(hid)
-        logits_deg_vi = self.deg_head_vi(hid)
+        feat = self._extract_feat(images=images, feat=feat)
+        logits_mod, logits_deg_ir, logits_deg_vi = self._predict_logits(feat)
 
         p_mod = self._stable_softmax(logits_mod)
         p_deg_ir = self._stable_softmax(logits_deg_ir)
         p_deg_vi = self._stable_softmax(logits_deg_vi)
-
-        p_ir = p_mod[:, 0:1] * p_deg_ir
-        p_vi = p_mod[:, 1:2] * p_deg_vi
-        p_global = torch.cat([p_ir, p_vi], dim=-1)
+        p_global = self._compose_gating(p_mod, p_deg_ir, p_deg_vi)
 
         assert logits_mod.shape[1] == 2
         assert logits_deg_ir.shape[1] == self.kir
         assert logits_deg_vi.shape[1] == self.kvi
         assert p_global.shape == (feat.size(0), self.kir + self.kvi)
 
-        out = {
+        outputs = {
             "feat": feat,
             "logits_mod": logits_mod,
             "logits_deg_ir": logits_deg_ir,
@@ -148,6 +177,6 @@ class HierarchicalPromptPredictor(nn.Module):
             "p_deg_vi": p_deg_vi,
             "P": p_global,
         }
-        if not return_logits:
-            return out
-        return out
+        if return_logits:
+            return outputs
+        return outputs
