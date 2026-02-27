@@ -1,40 +1,37 @@
-"""Prompt bank utilities for hierarchical gating."""
+"""Prompt bank modules for reconstruction with hierarchical gating."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PromptBank(nn.Module):
-    """Simple text/visual prompt banks with gating-based weighting."""
+    """Learnable prompt pool bank of shape (K, D)."""
 
-    def __init__(self, num_prompts: int, prompt_dim: int) -> None:
+    def __init__(self, k: int, d: int) -> None:
         super().__init__()
-        self.num_prompts = num_prompts
-        self.prompt_dim = prompt_dim
-        self.text_bank = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
-        self.visual_bank = nn.Parameter(torch.randn(num_prompts, prompt_dim) * 0.02)
+        self.k = k
+        self.d = d
+        self.bank = nn.Parameter(torch.randn(k, d) * 0.02)
 
-    def init_text_from_clip(self, *_args, **_kwargs) -> None:
-        """Placeholder hook for future CLIP-based text prompt initialization."""
+    def normalize_bank(self, mode: str = "none") -> None:
+        """In-place normalization for stability."""
+        with torch.no_grad():
+            if mode == "none":
+                return
+            if mode == "l2":
+                self.bank.copy_(F.normalize(self.bank, dim=-1))
+                return
+            raise ValueError(f"Unsupported normalize mode: {mode}")
 
-    def init_visual_from_clip(self, *_args, **_kwargs) -> None:
-        """Placeholder hook for future CLIP-based visual prompt initialization."""
-
-    def weighted_text(self, p: torch.Tensor) -> torch.Tensor:
-        if p.ndim != 2 or p.size(1) != self.num_prompts:
-            raise ValueError(f"Expected P shape (B, {self.num_prompts}), got {tuple(p.shape)}")
-        out = p @ self.text_bank
-        assert out.shape == (p.size(0), self.prompt_dim)
-        return out
-
-    def weighted_visual(self, p: torch.Tensor) -> torch.Tensor:
-        if p.ndim != 2 or p.size(1) != self.num_prompts:
-            raise ValueError(f"Expected P shape (B, {self.num_prompts}), got {tuple(p.shape)}")
-        out = p @ self.visual_bank
-        assert out.shape == (p.size(0), self.prompt_dim)
-        return out
+    def forward(self, p: torch.Tensor) -> torch.Tensor:
+        if p.ndim != 2 or p.size(1) != self.k:
+            raise ValueError(f"Expected P shape (B, {self.k}), got {tuple(p.shape)}")
+        prompt = p @ self.bank
+        assert prompt.shape == (p.size(0), self.d)
+        return prompt
 
 
 def save_predictor_promptbank_checkpoint(

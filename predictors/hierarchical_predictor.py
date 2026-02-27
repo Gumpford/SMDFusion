@@ -180,3 +180,13 @@ class HierarchicalPromptPredictor(nn.Module):
         if return_logits:
             return outputs
         return outputs
+
+    @torch.no_grad()
+    def predict_P(self, images: torch.Tensor) -> torch.Tensor:
+        """Convenience inference API to return only global gating P."""
+        was_training = self.training
+        self.eval()
+        out = self.forward(images=images)
+        if was_training:
+            self.train()
+        return out["P"]
