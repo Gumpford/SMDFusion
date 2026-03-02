@@ -13,56 +13,50 @@ _DINO_OUT_DIM = {
 
 
 class FrozenDINOv2Encoder(nn.Module):
-    """Frozen DINOv2 encoder extracting 4 intermediate maps."""
+    """Shared frozen DINOv2 encoder with trainable 1x1 projections to hidden_dim."""
 
-    def __init__(self, model_name: str = "dinov2_vitb14", hidden_dim: int = 256, local_ckpt: str = "") -> None:
+    def __init__(self, model_name: str = "dinov2_vitb14", hidden_dim: int = 256) -> None:
         super().__init__()
-        self.model_name = model_name
-        self.hidden_dim = hidden_dim
-        if local_ckpt:
-            dino = torch.load(local_ckpt, map_location="cpu")
-        else:
-            dino = torch.hub.load("facebookresearch/dinov2", model_name)
-        self.dino = dino
+        self.dino = torch.hub.load("facebookresearch/dinov2", model_name)
+        self.dino.eval()
         for p in self.dino.parameters():
             p.requires_grad = False
-        self.dino.eval()
 
         in_dim = _DINO_OUT_DIM.get(model_name, 768)
-        self.proj = nn.ModuleList([nn.Conv2d(in_dim, hidden_dim, kernel_size=1) for _ in range(4)])
+        self.proj = nn.ModuleList([nn.Conv2d(in_dim, hidden_dim, 1) for _ in range(4)])
 
-    @torch.no_grad()
-    def _forward_tokens(self, x3: torch.Tensor) -> List[torch.Tensor]:
-        if hasattr(self.dino, "get_intermediate_layers"):
+        # DINOv2 commonly uses ImageNet style normalization.
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def _extract_tokens(self, x3: torch.Tensor) -> List[torch.Tensor]:
+        with torch.no_grad():
             outs = self.dino.get_intermediate_layers(x3, n=4, reshape=False)
-            return list(outs)
-        ff = self.dino.forward_features(x3)
-        toks = ff["x_norm_patchtokens"]
-        return [toks, toks, toks, toks]
+        return list(outs)
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        assert x.dim() == 4, f"Expected BCHW, got {x.shape}"
+        if x.dim() != 4:
+            raise ValueError(f"Expected BCHW, got {tuple(x.shape)}")
         if x.size(1) == 1:
-            x3 = x.repeat(1, 3, 1, 1)
-        elif x.size(1) == 3:
-            x3 = x
-        else:
-            raise ValueError(f"Input channels must be 1 or 3, got {x.size(1)}")
+            x = x.repeat(1, 3, 1, 1)
+        if x.size(1) != 3:
+            raise ValueError(f"DINO input channels must be 1 or 3, got {x.size(1)}")
 
-        h, w = x3.shape[-2:]
-        x3 = F.interpolate(x3, size=((h // 14) * 14, (w // 14) * 14), mode="bilinear", align_corners=False)
+        x = (x - self.mean.to(x.device, x.dtype)) / self.std.to(x.device, x.dtype)
+        h, w = x.shape[-2:]
+        h14, w14 = max(14, (h // 14) * 14), max(14, (w // 14) * 14)
+        if h14 != h or w14 != w:
+            x = F.interpolate(x, size=(h14, w14), mode="bilinear", align_corners=False)
 
-        tokens_list = self._forward_tokens(x3)
-        feats = []
-        for i, toks in enumerate(tokens_list):
-            if toks.dim() == 3:
-                b, n, c = toks.shape
-                side = int(n ** 0.5)
-                fmap = toks.transpose(1, 2).reshape(b, c, side, side)
-            elif toks.dim() == 4:
-                fmap = toks
-            else:
-                raise RuntimeError(f"Unexpected DINO intermediate shape: {tuple(toks.shape)}")
-            fmap = self.proj[i](fmap)
-            feats.append(fmap)
+        tokens = self._extract_tokens(x)
+        feats: List[torch.Tensor] = []
+        for i, t in enumerate(tokens):
+            if t.dim() != 3:
+                raise RuntimeError(f"Unexpected token shape: {tuple(t.shape)}")
+            b, n, c = t.shape
+            side = int(n ** 0.5)
+            if side * side != n:
+                raise RuntimeError(f"Token number {n} is not square.")
+            fmap = t.transpose(1, 2).reshape(b, c, side, side)
+            feats.append(self.proj[i](fmap))
         return feats
