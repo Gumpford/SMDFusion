@@ -49,7 +49,18 @@ class CleanToDegradedReconDataset(Dataset):
             raise RuntimeError(f"No images found under {root}/IR/clean or {root}/VI/clean")
 
     def _scan_items(self) -> List[Dict]:
+        """
+        Supported layouts:
+        1) Split by modality (recommended):
+           root/IR/clean/*.png
+           root/VI/clean/*.png
+        2) Mixed clean folder:
+           root/clean/**/*.{png,jpg,...}
+           modality inferred from parent folder or filename token (ir/vi).
+        """
         items: List[Dict] = []
+
+        # Layout-1: explicit modality folders
         for mod in ["IR", "VI"]:
             clean_dir = self.root / mod / "clean"
             if not clean_dir.exists():
@@ -57,7 +68,47 @@ class CleanToDegradedReconDataset(Dataset):
             for p in clean_dir.iterdir():
                 if p.suffix.lower() in IMG_EXTS:
                     items.append({"path": str(p), "modality": mod})
+
+        if items:
+            return sorted(items, key=lambda x: x["path"])
+
+        # Layout-2: mixed clean folder, infer modality
+        mixed_clean = self.root / "clean"
+        if mixed_clean.exists():
+            for p in mixed_clean.rglob("*"):
+                if not p.is_file() or p.suffix.lower() not in IMG_EXTS:
+                    continue
+                mod = self._infer_modality_from_path(p)
+                items.append({"path": str(p), "modality": mod})
+
         return sorted(items, key=lambda x: x["path"])
+
+    @staticmethod
+    def _infer_modality_from_path(path: Path) -> str:
+        """Infer modality from parent folder names or filename tokens.
+
+        Accepted cues (case-insensitive):
+        - parent folder contains 'ir' or 'vi'
+        - filename stem contains tokens separated by [_-.] with 'ir' or 'vi'
+        """
+        parts = [p.lower() for p in path.parts]
+        if any(part == "ir" for part in parts):
+            return "IR"
+        if any(part == "vi" for part in parts):
+            return "VI"
+
+        stem = path.stem.lower().replace("-", "_").replace(".", "_")
+        tokens = stem.split("_")
+        if "ir" in tokens:
+            return "IR"
+        if "vi" in tokens:
+            return "VI"
+
+        raise RuntimeError(
+            "Cannot infer modality for mixed-layout sample: "
+            f"{path}. Please either use root/IR/clean & root/VI/clean, "
+            "or include modality cues in parent folder/file name (ir/vi)."
+        )
 
     def __len__(self) -> int:
         return len(self.items)
